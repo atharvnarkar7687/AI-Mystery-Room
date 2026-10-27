@@ -4,9 +4,29 @@ import axios from 'axios';
 import './App.css';
 
 const API_URL = 'https://ai-mystery-room-api-wnex.onrender.com/api';
+const REQUEST_TIMEOUT = 240000;
 
 const DEFAULT_PREMISE =
   'A priceless diamond disappears from a hotel during a party. Three guests had access to the room, and each has a suspicious alibi.';
+
+function getRequestErrorMessage(error, action = 'complete this request') {
+  if (error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT') {
+    return 'The request timed out. The backend or AI may be taking too long. Please try again.';
+  }
+
+  if (error.response) {
+    return (
+      error.response.data?.message ||
+      `The server returned error ${error.response.status}. Please try again.`
+    );
+  }
+
+  if (error.request) {
+    return 'Could not reach the backend. Check your internet connection and make sure the API is running.';
+  }
+
+  return `Could not ${action}. ${error.message || 'Please try again.'}`;
+}
 
 function App() {
   const [premise, setPremise] = useState(DEFAULT_PREMISE);
@@ -41,16 +61,20 @@ function App() {
           premise: premise.trim(),
           difficulty,
         },
-        { timeout: 240000 }
+        { timeout: REQUEST_TIMEOUT }
       );
 
       setCaseData(response.data.case);
       setMessage(response.data.message || 'Mystery generated successfully!');
     } catch (error) {
-      setMessage(
-        error.response?.data?.message ||
-          'The request took too long. Check the backend terminal and try again.'
-      );
+      console.error('Mystery generation failed:', {
+        message: error.message,
+        code: error.code,
+        status: error.response?.status,
+        response: error.response?.data,
+      });
+
+      setMessage(getRequestErrorMessage(error, 'generate the mystery'));
     } finally {
       setLoading(false);
     }
@@ -66,15 +90,16 @@ function App() {
 
     try {
       const response = await axios.post(
-        `${API_URL}/cases/${caseData.id}/clues/${clue.id}/discover`
+        `${API_URL}/cases/${caseData.id}/clues/${clue.id}/discover`,
+        {},
+        { timeout: 30000 }
       );
 
       setCaseData(response.data.case);
       setMessage(response.data.message);
     } catch (error) {
-      setMessage(
-        error.response?.data?.message || 'Could not discover this clue.'
-      );
+      console.error('Discovering clue failed:', error);
+      setMessage(getRequestErrorMessage(error, 'discover this clue'));
     } finally {
       setBusyAction('');
     }
@@ -88,7 +113,9 @@ function App() {
 
     try {
       const response = await axios.post(
-        `${API_URL}/cases/${caseData.id}/hints`
+        `${API_URL}/cases/${caseData.id}/hints`,
+        {},
+        { timeout: 30000 }
       );
 
       setRevealedHints((previous) => [
@@ -99,9 +126,8 @@ function App() {
       setCaseData(response.data.case);
       setMessage(response.data.message);
     } catch (error) {
-      setMessage(
-        error.response?.data?.message || 'Could not retrieve a hint.'
-      );
+      console.error('Getting hint failed:', error);
+      setMessage(getRequestErrorMessage(error, 'retrieve a hint'));
     } finally {
       setBusyAction('');
     }
@@ -129,7 +155,8 @@ function App() {
     try {
       const response = await axios.post(
         `${API_URL}/cases/${caseData.id}/accuse`,
-        { suspectId: selectedSuspect }
+        { suspectId: selectedSuspect },
+        { timeout: 30000 }
       );
 
       setResult(response.data.result);
@@ -139,9 +166,8 @@ function App() {
       }));
       setMessage(response.data.message);
     } catch (error) {
-      setMessage(
-        error.response?.data?.message || 'Could not submit your accusation.'
-      );
+      console.error('Submitting accusation failed:', error);
+      setMessage(getRequestErrorMessage(error, 'submit your accusation'));
     } finally {
       setBusyAction('');
     }
@@ -185,6 +211,7 @@ function App() {
         {message && (
           <div
             role="status"
+            aria-live="polite"
             className="mb-6 rounded-xl border border-cyan-900 bg-cyan-950/50 p-4 text-cyan-100"
           >
             {message}
@@ -251,9 +278,10 @@ function App() {
               </button>
 
               {loading && (
-                <p className="text-sm text-slate-400">
-                  AI may take a little while to create your case. Please wait
-                  and keep this page open.
+                <p className="text-sm text-slate-400" role="status">
+                  Connecting to the AI detective engine. Generating your
+                  mystery may take a little while, especially when the
+                  backend is waking up. Keep this page open.
                 </p>
               )}
             </form>
@@ -280,22 +308,13 @@ function App() {
               </p>
 
               <div className="mt-6 grid grid-cols-2 gap-3 sm:grid-cols-4">
-                <Stat
-                  label="Suspects"
-                  value={caseData.suspects.length}
-                />
+                <Stat label="Suspects" value={caseData.suspects.length} />
                 <Stat
                   label="Clues found"
                   value={`${caseData.discoveredClueIds.length}/${caseData.clues.length}`}
                 />
-                <Stat
-                  label="Hints left"
-                  value={caseData.hintsAvailable}
-                />
-                <Stat
-                  label="Hints used"
-                  value={caseData.hintsUsed}
-                />
+                <Stat label="Hints left" value={caseData.hintsAvailable} />
+                <Stat label="Hints used" value={caseData.hintsUsed} />
               </div>
             </section>
 
@@ -469,8 +488,7 @@ function App() {
                 </h2>
 
                 <p className="mt-4 text-lg">
-                  Your accusation:{' '}
-                  <strong>{result.accusedSuspect}</strong>
+                  Your accusation: <strong>{result.accusedSuspect}</strong>
                 </p>
 
                 <p className="mt-2 text-lg">

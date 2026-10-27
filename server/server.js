@@ -16,16 +16,36 @@ const ai = process.env.GEMINI_API_KEY
   ? new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY })
   : null;
 
+// Allow local development and the deployed Vercel frontend.
+const allowedOrigins = [
+  'http://localhost:5173',
+  'http://localhost:5174',
+  'https://ai-mystery-room-olive.vercel.app',
+  process.env.CLIENT_URL,
+].filter(Boolean);
+
 app.use(
   cors({
-    origin: [
-      'http://localhost:5173',
-      'http://localhost:5174',
-    ],
+    origin: allowedOrigins,
+    methods: ['GET', 'POST', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
   })
 );
 
 app.use(express.json({ limit: '1mb' }));
+
+// Log request duration to help diagnose slow API calls.
+app.use((req, res, next) => {
+  const startedAt = Date.now();
+
+  res.on('finish', () => {
+    console.log(
+      `${req.method} ${req.originalUrl} ${res.statusCode} - ${Date.now() - startedAt}ms`
+    );
+  });
+
+  next();
+});
 
 const difficultySettings = {
   Easy: { suspects: 3, clues: 5, hints: 2, baseScore: 100 },
@@ -38,7 +58,9 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 function getErrorStatus(error) {
   const status = error?.status ?? error?.code ?? error?.error?.code;
 
-  if (Number.isInteger(Number(status))) return Number(status);
+  if (Number.isInteger(Number(status))) {
+    return Number(status);
+  }
 
   const match = String(error?.message || '').match(
     /\b(400|401|403|404|429|500|502|503|504)\b/
@@ -61,12 +83,16 @@ async function generateWithRetry(callback, maxAttempts = 3) {
       const status = getErrorStatus(error);
       const retryable = [429, 500, 502, 503, 504].includes(status);
 
-      if (!retryable || attempt === maxAttempts) throw error;
+      if (!retryable || attempt === maxAttempts) {
+        throw error;
+      }
 
       const delay = attempt * 1500;
+
       console.warn(
-        `Gemini returned ${status}. Retrying in ${delay / 1000}s...`
+        `Gemini returned status ${status}. Retry ${attempt + 1}/${maxAttempts} in ${delay / 1000}s.`
       );
+
       await sleep(delay);
     }
   }
@@ -78,7 +104,6 @@ function cleanText(value) {
   return typeof value === 'string' ? value.trim() : '';
 }
 
-// Convert a database document into the existing game object format.
 function fromDatabase(document) {
   const game = document.toObject();
   game.id = game.gameId;
@@ -87,7 +112,6 @@ function fromDatabase(document) {
   return game;
 }
 
-// Convert a game object into the MongoDB document format.
 function toDatabase(game) {
   const { id, _id, __v, ...fields } = game;
   return { ...fields, gameId: id };
@@ -230,6 +254,8 @@ app.get('/api/health', (req, res) => {
 
 // Create a mystery
 app.post('/api/cases', async (req, res) => {
+  const startedAt = Date.now();
+
   try {
     const premise = cleanText(req.body?.premise);
     const difficulty = req.body?.difficulty;
@@ -251,7 +277,14 @@ app.post('/api/cases', async (req, res) => {
     if (!ai) {
       return res.status(500).json({
         success: false,
-        message: 'Gemini API key is missing from server/.env.',
+        message: 'Gemini API key is not configured on the backend.',
+      });
+    }
+
+    if (mongoose.connection.readyState !== 1) {
+      return res.status(503).json({
+        success: false,
+        message: 'Database is not connected. Please try again shortly.',
       });
     }
 
@@ -304,13 +337,17 @@ Requirements:
 - Do not include Markdown or code fences.
 `;
 
-    console.log(`Generating ${difficulty} mystery using ${MODEL_NAME}...`);
+    console.log(
+      `Starting ${difficulty} mystery generation with ${MODEL_NAME}.`
+    );
 
     const response = await generateWithRetry(() =>
       ai.models.generateContent({
         model: MODEL_NAME,
         contents: prompt,
-        config: { responseMimeType: 'application/json' },
+        config: {
+          responseMimeType: 'application/json',
+        },
       })
     );
 
@@ -323,7 +360,14 @@ Requirements:
       throw new Error('Gemini returned an empty response.');
     }
 
-    const generated = JSON.parse(responseText);
+    let generated;
+
+    try {
+      generated = JSON.parse(responseText);
+    } catch {
+      throw new SyntaxError('Gemini returned invalid JSON.');
+    }
+
     validateGeneratedMystery(generated, config);
 
     const game = {
@@ -360,10 +404,11 @@ Requirements:
       accusationCorrect: null,
     };
 
-    // Persist before responding to the frontend.
     await new Case(toDatabase(game)).save();
 
-    console.log(`Mystery saved to MongoDB: ${game.id}`);
+    console.log(
+      `Mystery saved successfully: ${game.id}. Total generation time: ${Date.now() - startedAt}ms`
+    );
 
     return res.status(201).json({
       success: true,
@@ -372,7 +417,14 @@ Requirements:
     });
   } catch (error) {
     const status = getErrorStatus(error);
-    console.error('Mystery generation failed:', getErrorMessage(error));
+
+    // Log technical details for diagnosis. Never log API keys or database URIs.
+    console.error('Mystery generation failed:', {
+      message: getErrorMessage(error),
+      status,
+      name: error?.name,
+      elapsedMs: Date.now() - startedAt,
+    });
 
     if (status === 429) {
       return res.status(429).json({
@@ -391,18 +443,28 @@ Requirements:
     if ([401, 403].includes(status)) {
       return res.status(status).json({
         success: false,
-        message: 'Check your Gemini API key and model access.',
+        message: 'Check the Gemini API key and model access in Render.',
+      });
+    }
+
+    if (status === 404) {
+      return res.status(502).json({
+        success: false,
+        message: 'The configured Gemini model was not found or is unavailable.',
       });
     }
 
     if (error instanceof SyntaxError) {
       return res.status(502).json({
         success: false,
-        message: 'Gemini returned invalid JSON. Try again.',
+        message: 'Gemini returned invalid JSON. Please try again.',
       });
     }
 
-    if (error.name === 'ValidationError' || error.code === 11000) {
+    if (
+      error.name === 'ValidationError' ||
+      error.code === 11000
+    ) {
       return res.status(500).json({
         success: false,
         message: 'The case could not be saved to MongoDB.',
@@ -411,7 +473,7 @@ Requirements:
 
     return res.status(500).json({
       success: false,
-      message: 'Mystery generation or database saving failed. Check the backend terminal.',
+      message: 'Mystery generation or database saving failed. Check backend logs.',
     });
   }
 });
@@ -425,7 +487,10 @@ app.get('/api/cases/:id', async (req, res) => {
     res.json({ success: true, case: publicCase(game) });
   } catch (error) {
     console.error('Loading case failed:', getErrorMessage(error));
-    res.status(500).json({ success: false, message: 'Could not load the case.' });
+    res.status(500).json({
+      success: false,
+      message: 'Could not load the case.',
+    });
   }
 });
 
@@ -445,7 +510,10 @@ app.post('/api/cases/:id/clues/:clueId/discover', async (req, res) => {
     const clue = game.clues.find((item) => item.id === req.params.clueId);
 
     if (!clue) {
-      return res.status(404).json({ success: false, message: 'Clue not found.' });
+      return res.status(404).json({
+        success: false,
+        message: 'Clue not found.',
+      });
     }
 
     const alreadyDiscovered = game.discoveredClueIds.includes(clue.id);
@@ -465,7 +533,10 @@ app.post('/api/cases/:id/clues/:clueId/discover', async (req, res) => {
     });
   } catch (error) {
     console.error('Discovering clue failed:', getErrorMessage(error));
-    res.status(500).json({ success: false, message: 'Could not update the clue.' });
+    res.status(500).json({
+      success: false,
+      message: 'Could not update the clue.',
+    });
   }
 });
 
@@ -483,7 +554,10 @@ app.post('/api/cases/:id/hints', async (req, res) => {
     }
 
     if (game.hintsUsed >= game.hints.length) {
-      return res.status(400).json({ success: false, message: 'No hints remain.' });
+      return res.status(400).json({
+        success: false,
+        message: 'No hints remain.',
+      });
     }
 
     const hint = game.hints[game.hintsUsed];
@@ -501,7 +575,10 @@ app.post('/api/cases/:id/hints', async (req, res) => {
     });
   } catch (error) {
     console.error('Getting hint failed:', getErrorMessage(error));
-    res.status(500).json({ success: false, message: 'Could not retrieve the hint.' });
+    res.status(500).json({
+      success: false,
+      message: 'Could not retrieve the hint.',
+    });
   }
 });
 
@@ -554,7 +631,10 @@ app.post('/api/cases/:id/accuse', async (req, res) => {
     });
   } catch (error) {
     console.error('Submitting accusation failed:', getErrorMessage(error));
-    res.status(500).json({ success: false, message: 'Could not submit the accusation.' });
+    res.status(500).json({
+      success: false,
+      message: 'Could not submit the accusation.',
+    });
   }
 });
 
@@ -593,13 +673,19 @@ app.get('/api/cases/:id/result', async (req, res) => {
     res.json({ success: true, result: buildResult(game) });
   } catch (error) {
     console.error('Loading result failed:', getErrorMessage(error));
-    res.status(500).json({ success: false, message: 'Could not load the result.' });
+    res.status(500).json({
+      success: false,
+      message: 'Could not load the result.',
+    });
   }
 });
 
 // Unknown endpoint
 app.use((req, res) => {
-  res.status(404).json({ success: false, message: 'API endpoint not found.' });
+  res.status(404).json({
+    success: false,
+    message: 'API endpoint not found.',
+  });
 });
 
 // Malformed JSON and other middleware errors
@@ -622,7 +708,7 @@ app.use((error, req, res, next) => {
 async function startServer() {
   try {
     if (!process.env.MONGODB_URI) {
-      throw new Error('MONGODB_URI is missing from server/.env');
+      throw new Error('MONGODB_URI is missing from server environment variables.');
     }
 
     await mongoose.connect(process.env.MONGODB_URI, {
@@ -633,8 +719,9 @@ async function startServer() {
     console.log(`Database: ${mongoose.connection.name}`);
 
     app.listen(PORT, () => {
-      console.log(`Server running at http://localhost:${PORT}`);
+      console.log(`Server listening on port ${PORT}`);
       console.log(`Gemini configured: ${Boolean(ai)}`);
+      console.log('Allowed frontend origins:', allowedOrigins);
     });
   } catch (error) {
     console.error('Server startup failed:', getErrorMessage(error));
