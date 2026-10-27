@@ -3,7 +3,7 @@ import { useState } from 'react';
 import axios from 'axios';
 import './App.css';
 
-const API_URL = 'http://localhost:5000/api';
+const API_URL = 'https://ai-mystery-room-api-wnex.onrender.com/api';
 
 const DEFAULT_PREMISE =
   'A priceless diamond disappears from a hotel during a party. Three guests had access to the room, and each has a suspicious alibi.';
